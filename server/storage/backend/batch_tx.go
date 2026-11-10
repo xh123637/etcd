@@ -279,6 +279,20 @@ func (t *batchTx) safePending() int {
 }
 
 func (t *batchTx) commit(stop bool) {
+	// If the commit panics (e.g. bbolt panicking in Tx.Commit on a corrupt
+	// db file), the panic unwinds without releasing the batchTx mutex: that
+	// is deliberate (see #21939 and #21964), so the backend can never be
+	// reused after a possibly inconsistent write. Record that the backend
+	// is poisoned so that Close() does not wait forever for the background
+	// committer, which would otherwise block on the same mutex and hide the
+	// original panic (see #22750). The mutex itself stays held.
+	defer func() {
+		if r := recover(); r != nil {
+			t.backend.markPoisoned()
+			panic(r)
+		}
+	}()
+
 	// commit the last tx
 	if t.tx != nil {
 		if t.pending == 0 && !stop {
@@ -372,6 +386,17 @@ func (t *batchTxBuffered) CommitAndStop() {
 }
 
 func (t *batchTxBuffered) commit(stop bool) {
+	// See the deferred recover in batchTx.commit: a panic anywhere in the
+	// commit path must mark the backend as poisoned. This covers the
+	// pre-commit hooks and the readTx lock below, which run before
+	// batchTx.commit is reached.
+	defer func() {
+		if r := recover(); r != nil {
+			t.backend.markPoisoned()
+			panic(r)
+		}
+	}()
+
 	// all read txs must be closed to acquire boltdb commit rwlock
 	t.backend.readTx.Lock()
 	t.unsafeCommit(stop)

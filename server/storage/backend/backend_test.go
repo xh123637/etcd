@@ -18,6 +18,7 @@ import (
 	"fmt"
 	"os"
 	"reflect"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -48,6 +49,62 @@ func TestBackendClose(t *testing.T) {
 	case <-done:
 	case <-time.After(10 * time.Second):
 		t.Errorf("failed to close database in 10s")
+	}
+}
+
+// TestBackendCloseAfterCommitPanic is a regression test for
+// https://github.com/etcd-io/etcd/issues/22750: when a commit panics, the
+// batchTx mutex is intentionally left locked (see #21939 and #21964) so the
+// backend can never be reused. The deferred backend.Close() must still
+// return instead of blocking forever on the background committer, so that
+// the original panic is printed and the process can exit instead of hanging
+// silently, as `etcdutl snapshot restore` did.
+func TestBackendCloseAfterCommitPanic(t *testing.T) {
+	// The hook panics only once armed, simulating a panic inside a commit
+	// (e.g. bbolt panicking in Tx.Commit on a corrupt db file) while the
+	// batchTx mutex is held.
+	armed := &atomic.Bool{}
+	cfg := backend.DefaultBackendConfig(zaptest.NewLogger(t))
+	cfg.BatchInterval, cfg.BatchLimit = time.Hour, 10000
+	cfg.Hooks = backend.NewHooks(func(tx backend.UnsafeReadWriter) {
+		if armed.Load() {
+			panic("simulated commit panic")
+		}
+	})
+	be, _ := betesting.NewTmpBackendFromCfg(t, cfg)
+
+	// Put something so there is a pending write to commit.
+	tx := be.BatchTx()
+	tx.Lock()
+	tx.UnsafeCreateBucket(bucket)
+	tx.UnsafePut(bucket, key, []byte("v"))
+	tx.Unlock()
+
+	// Trigger a commit panic on this goroutine. The panic must propagate
+	// to the caller with its original value.
+	armed.Store(true)
+	func() {
+		defer func() {
+			r := recover()
+			require.NotNil(t, r, "expected ForceCommit to panic")
+			assert.Equal(t, "simulated commit panic", r)
+		}()
+		be.ForceCommit()
+	}()
+
+	// Close must return promptly with an error describing the poisoned
+	// backend instead of hanging forever waiting for the background
+	// committer, which is blocked on the lock the panicked commit left held.
+	done := make(chan error, 1)
+	go func() {
+		done <- be.Close()
+	}()
+	select {
+	case err := <-done:
+		require.Error(t, err)
+		assert.Contains(t, err.Error(), "poisoned")
+	case <-time.After(10 * time.Second):
+		t.Fatal("backend.Close() did not return within 10s after a commit panic")
 	}
 }
 

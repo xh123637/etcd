@@ -16,6 +16,7 @@ package backend
 
 import (
 	"bytes"
+	"errors"
 	"fmt"
 	"hash/crc32"
 	"io"
@@ -130,6 +131,15 @@ type backend struct {
 
 	stopc chan struct{}
 	donec chan struct{}
+
+	// poisoned is set when a commit panics while holding the batchTx
+	// mutex. The mutex is intentionally never released afterwards (see
+	// #21939 and #21964), so the backend can never be reused after a
+	// possibly inconsistent write. poisonedCh is closed when poisoned is
+	// first set so that Close() can stop waiting for the background
+	// committer instead of blocking forever (see #22750).
+	poisoned   atomic.Bool
+	poisonedCh chan struct{}
 
 	// nonBlockingDefrag enables non-blocking defragmentation.
 	nonBlockingDefrag bool
@@ -264,6 +274,8 @@ func newBackend(bcfg BackendConfig) *backend {
 
 		stopc: make(chan struct{}),
 		donec: make(chan struct{}),
+
+		poisonedCh: make(chan struct{}),
 
 		nonBlockingDefrag: bcfg.NonBlockingDefrag,
 
@@ -468,6 +480,15 @@ func (b *backend) run() {
 		select {
 		case <-t.C:
 		case <-b.stopc:
+			if b.poisoned.Load() {
+				// A commit panicked while holding the batchTx mutex, which
+				// is intentionally never released afterwards (see #21939),
+				// so the final commit can never succeed. Skip it instead
+				// of blocking forever: Close() is waiting on donec and the
+				// original panic must be allowed to unwind and be printed.
+				b.lg.Warn("skipping final commit during backend close: batch transaction poisoned by a panicked commit")
+				return
+			}
 			b.batchTx.CommitAndStop()
 			return
 		}
@@ -478,9 +499,41 @@ func (b *backend) run() {
 	}
 }
 
+// markPoisoned records that a commit panicked while holding the batchTx
+// mutex. It is called from a deferred recover during the panic unwind, so
+// it must not take any lock: the panicking goroutine holds the batchTx
+// mutex and may hold the readTx lock as well.
+func (b *backend) markPoisoned() {
+	if b.poisoned.CompareAndSwap(false, true) {
+		close(b.poisonedCh)
+	}
+}
+
+// errBackendPoisoned is returned by Close when a commit panicked while
+// holding the batchTx mutex. The backend can never be used again, and
+// closing the underlying bbolt database is unsafe: the panicked write
+// transaction never released bbolt's write lock (bbolt's Tx.Commit has no
+// deferred cleanup), so DB.Close would block forever on it as well.
+var errBackendPoisoned = errors.New("backend: batch transaction poisoned by a panicked commit; backend close aborted")
+
 func (b *backend) Close() error {
 	close(b.stopc)
-	<-b.donec
+	select {
+	case <-b.donec:
+	case <-b.poisonedCh:
+		// A commit panicked while holding the batchTx mutex. The
+		// background committer can never acquire it, so waiting for donec
+		// would block forever and hide the original panic (see #22750).
+		// Return without closing the bbolt database: the panicked write
+		// transaction still holds its locks. The caller is unwinding from
+		// the panic, so the process is about to die with the panic visible.
+		return errBackendPoisoned
+	}
+	if b.poisoned.Load() {
+		// The backend was poisoned just as the background committer
+		// stopped; do not touch the bbolt database for the same reason.
+		return errBackendPoisoned
+	}
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	return b.db.Close()
